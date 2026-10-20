@@ -1,0 +1,1295 @@
+// =============================================================================
+// Digiink Solutions Travel CRM — UNIFIED SCHEMA (single shared MySQL database)
+//
+// ARCHITECTURE NOTE: the SRS's original design called for one isolated MySQL
+// database per client. This project intentionally uses a single shared
+// database instead, with every tenant-scoped model carrying a `clientId`
+// column, because local development runs on XAMPP/MariaDB where spinning up
+// and migrating a fresh database per client isn't practical. Isolation is
+// now enforced in application code (every tenant query is scoped by
+// clientId — see tenant-scope.guard.ts) rather than structurally by the
+// database layer. If this ever moves to a real per-client-DB deployment,
+// this is the file that would need to split back into control + tenant
+// schemas.
+// =============================================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../src/generated/client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Control-level models (Super Admin only)
+// -----------------------------------------------------------------------------
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRING_SOON
+  GRACE
+  LOCKED
+  DELETED
+}
+
+model Plan {
+  id                   String   @id @default(cuid())
+  name                 String   @unique
+  priceInPaise         Int
+  entitlements         Json
+  maxUsers             Int?
+  maxEnquiriesPerMonth Int?
+  maxBranches          Int?
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  clients Client[]
+
+  @@map("plans")
+}
+
+model Client {
+  id           String @id @default(cuid())
+  clientCode   String @unique
+  businessName String
+  subdomain    String? @unique
+  ownerName    String
+  email        String @unique
+  phone        String
+
+  planId String
+  plan   Plan   @relation(fields: [planId], references: [id])
+
+  subscriptionStatus SubscriptionStatus @default(ACTIVE)
+  subscriptionStart  DateTime
+  subscriptionExpiry DateTime
+  graceEndsAt        DateTime?
+  lockedAt           DateTime?
+  deletedAt          DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  onboardingCompleted Boolean @default(false)
+  customEntitlements  Json?   @map("custom_entitlements")
+
+  paymentLogs    PaymentLog[]
+  paymentNotices PaymentNotice[]
+  roles          Role[]
+  users          User[]
+  customers      Customer[]
+  enquiries      Enquiry[]
+  followUps      FollowUp[]
+  quotations     Quotation[]
+  bookings       Booking[]
+  trips          Trip[]
+  drivers        Driver[]
+  vehicles       Vehicle[]
+  payments       Payment[]
+  invoices       Invoice[]
+  documents      Document[]
+  auditLogs      AuditLog[]
+  companyProfile CompanyProfile?
+  branches       Branch[]
+  automationRules AutomationRule[]
+  automationLogs  AutomationLog[]
+  whatsAppConfig      WhatsAppConfig?
+  whatsAppMessages    WhatsAppMessage[]
+  whatsAppTemplates   WhatsAppTemplate[]
+  customFieldDefinitions CustomFieldDefinition[]
+  customFieldValues      CustomFieldValue[]
+  itineraries            Itinerary[]
+  tourTemplates          TourTemplate[]
+  suppliers              Supplier[]
+  bookingCostItems       BookingCostItem[]
+  supplierPayments       SupplierPayment[]
+  hotelVouchers          HotelVoucher[]
+  dutySlips              DutySlip[]
+  dutySlipExpenses       DutySlipExpense[]
+  bookingTravelers       BookingTraveler[]
+  bookingDocuments       BookingDocument[]
+  vehicleMaintenance     VehicleMaintenance[]
+
+  @@index([subscriptionStatus])
+  @@map("clients")
+}
+
+// Step 1+2 of the onboarding wizard (SRS section 13). One row per client.
+model CompanyProfile {
+  id           String   @id @default(cuid())
+  clientId     String   @unique
+  client       Client   @relation(fields: [clientId], references: [id])
+  companyName  String?
+  logoUrl      String?
+  address      String?
+  gstNumber    String?
+  phone        String?
+  email        String?
+  businessType String?
+  currency     String?  @default("INR")
+  primaryColor String?  @default("#2563eb") @map("primary_color")
+  secondaryColor String? @default("#0f172a") @map("secondary_color")
+  whatsappNumber String? @map("whatsapp_number")
+  websiteUrl   String?  @map("website_url")
+  itineraryFooterNotes String? @db.Text @map("itinerary_footer_notes")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("company_profiles")
+}
+
+// Step 3 of onboarding — only shown/usable when the client's plan includes
+// multi_branch (Enterprise). Kept minimal here; full multi-branch data
+// scoping is a Phase 10 (Enterprise) concern.
+model Branch {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id])
+  name      String
+  address   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  users     User[]
+  customers Customer[]
+  enquiries Enquiry[]
+  bookings  Booking[]
+
+  @@index([clientId])
+  @@map("branches")
+}
+
+// Short-lived email OTP issued after password verification on login.
+// Never stores the plain code — only a hash — and is single-use.
+model LoginOtp {
+  id        String   @id @default(cuid())
+  userId    String
+  codeHash  String
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("login_otps")
+}
+
+// Deliberately a separate table from LoginOtp (same shape) rather than a
+// shared `purpose` column: a code issued for one flow must never validate
+// against the other, and two tables make that guarantee structural instead
+// of relying on every query remembering to filter by purpose. userId has
+// no FK, same as LoginOtp — it's looked up across both SuperAdminUser and
+// User by email in the controller, so it can't be a relation to either.
+model PasswordResetOtp {
+  id        String   @id @default(cuid())
+  userId    String
+  codeHash  String
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("password_reset_otps")
+}
+
+model PaymentLog {
+  id            String   @id @default(cuid())
+  clientId      String
+  client        Client   @relation(fields: [clientId], references: [id])
+  amountInPaise Int
+  date          DateTime
+  mode          String
+  reference     String?
+  note          String?
+  confirmedBy   String
+  createdAt     DateTime @default(now())
+
+  @@index([clientId])
+  @@map("payment_logs")
+}
+
+model PaymentNotice {
+  id         String    @id @default(cuid())
+  clientId   String
+  client     Client    @relation(fields: [clientId], references: [id])
+  message    String?
+  status     String    @default("PENDING")
+  createdAt  DateTime  @default(now())
+  reviewedAt DateTime?
+  reviewedBy String?
+
+  @@index([clientId])
+  @@map("payment_notices")
+}
+
+model SuperAdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  @@map("super_admin_users")
+}
+
+model SuperAdminAuditLog {
+  id             String   @id @default(cuid())
+  actorId        String
+  actorEmail     String
+  action         String
+  targetClientId String?
+  metadata       Json?
+  ipAddress      String?
+  createdAt      DateTime @default(now())
+
+  @@index([targetClientId])
+  @@map("super_admin_audit_logs")
+}
+
+model SystemSetting {
+  key   String @id
+  value Json
+
+  @@map("system_settings")
+}
+
+// -----------------------------------------------------------------------------
+// Tenant-scoped models — every one of these carries clientId. Every query
+// against them MUST filter by clientId (see tenant-scope.guard.ts /
+// common/scoped-prisma.ts) since the database itself no longer enforces
+// isolation structurally.
+// -----------------------------------------------------------------------------
+
+model Role {
+  id              String   @id @default(cuid())
+  clientId        String
+  client          Client   @relation(fields: [clientId], references: [id])
+  name            String
+  permissionsJson Json
+  isSystemRole    Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  users User[]
+
+  @@unique([clientId, name])
+  @@index([clientId])
+  @@map("roles")
+}
+
+model User {
+  id                 String    @id @default(cuid())
+  clientId           String
+  client             Client    @relation(fields: [clientId], references: [id])
+  name               String
+  email              String    @unique
+  avatarUrl          String?
+  passwordHash       String
+  roleId             String
+  role               Role      @relation(fields: [roleId], references: [id])
+  branchId           String?
+  branch             Branch?   @relation(fields: [branchId], references: [id])
+  isClientAdmin      Boolean   @default(false)
+  isActive           Boolean   @default(true)
+  deletedAt          DateTime?
+  mustChangePassword Boolean   @default(true)
+  lastLoginAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  enquiriesAssigned Enquiry[]  @relation("AssignedStaff")
+  followUps         FollowUp[]
+  auditLogs         AuditLog[]
+
+  @@index([clientId])
+  @@map("users")
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id])
+  name      String
+  phone     String
+  email     String?
+  address   String?
+  notes     String?
+  branchId  String?
+  branch    Branch?  @relation(fields: [branchId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  enquiries  Enquiry[]
+  quotations Quotation[]
+  bookings   Booking[]
+  payments   Payment[]
+  invoices   Invoice[]
+  documents  Document[]
+  itineraries Itinerary[]
+
+  @@index([clientId])
+  @@map("customers")
+}
+
+enum EnquiryStatus {
+  NEW
+  CONTACTED
+  QUOTED
+  NEGOTIATION
+  WON
+  LOST
+}
+
+model Enquiry {
+  id           String        @id @default(cuid())
+  clientId     String
+  client       Client        @relation(fields: [clientId], references: [id])
+  customerId   String
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  source       String?
+  pickupLocation String?
+  destination  String?
+  travelDate   DateTime?
+  vehicleService String?
+  notes        String?       @db.Text
+  followUpDate DateTime?
+  status       EnquiryStatus @default(NEW)
+  assignedToId String?
+  assignedTo   User?         @relation("AssignedStaff", fields: [assignedToId], references: [id])
+  branchId     String?
+  branch       Branch?       @relation(fields: [branchId], references: [id])
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  followUps  FollowUp[]
+  quotations Quotation[]
+  itineraries Itinerary[]
+
+  @@index([clientId])
+  @@index([clientId, status])
+  @@map("enquiries")
+}
+
+model FollowUp {
+  id           String   @id @default(cuid())
+  clientId     String
+  client       Client   @relation(fields: [clientId], references: [id])
+  enquiryId    String
+  enquiry      Enquiry  @relation(fields: [enquiryId], references: [id])
+  loggedById   String
+  loggedBy     User     @relation(fields: [loggedById], references: [id])
+  activityType String
+  description  String?
+  createdAt    DateTime @default(now())
+
+  @@index([clientId])
+  @@index([enquiryId])
+  @@map("follow_ups")
+}
+
+enum QuotationStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+model Quotation {
+  id                 String          @id @default(cuid())
+  clientId           String
+  client             Client          @relation(fields: [clientId], references: [id])
+  enquiryId          String
+  enquiry            Enquiry         @relation(fields: [enquiryId], references: [id])
+  customerId         String
+  customer           Customer        @relation(fields: [customerId], references: [id])
+  version            Int             @default(1)
+  itineraryJson      Json
+  markupInPaise      Int             @default(0)
+  discountInPaise    Int             @default(0)
+  taxInPaise         Int             @default(0)
+  totalInPaise       Int
+  termsAndConditions String?         @db.Text
+  pdfFileUrl         String?
+  status             QuotationStatus @default(DRAFT)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  booking Booking?
+
+  @@index([clientId])
+  @@map("quotations")
+}
+
+enum BookingStatus {
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model Booking {
+  id            String        @id @default(cuid())
+  clientId      String
+  client        Client        @relation(fields: [clientId], references: [id])
+  quotationId   String        @unique
+  quotation     Quotation     @relation(fields: [quotationId], references: [id])
+  customerId    String
+  customer      Customer      @relation(fields: [customerId], references: [id])
+  travelStart   DateTime?
+  travelEnd     DateTime?
+  amountInPaise Int
+  status        BookingStatus @default(CONFIRMED)
+  voucherPdfUrl String?
+  paymentDueDate DateTime?
+  docShareToken String?       @unique @map("doc_share_token")
+  branchId      String?
+  branch        Branch?       @relation(fields: [branchId], references: [id])
+  driverId      String?
+  driver        Driver?       @relation(fields: [driverId], references: [id])
+  vehicleId     String?
+  vehicle       Vehicle?      @relation(fields: [vehicleId], references: [id])
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  trip     Trip?
+  payments Payment[]
+  invoices Invoice[]
+  costItems BookingCostItem[]
+  supplierPayments SupplierPayment[]
+  hotelVouchers HotelVoucher[]
+  travelers     BookingTraveler[]
+  documents     BookingDocument[]
+
+  @@index([clientId])
+  @@index([docShareToken])
+  @@map("bookings")
+}
+
+enum TripStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model Trip {
+  id             String     @id @default(cuid())
+  clientId       String
+  client         Client     @relation(fields: [clientId], references: [id])
+  bookingId      String     @unique
+  booking        Booking    @relation(fields: [bookingId], references: [id])
+  startDate      DateTime?
+  endDate        DateTime?
+  pickup         String?
+  drop           String?
+  itineraryNotes String?    @db.Text
+  driverId       String?
+  driver         Driver?    @relation(fields: [driverId], references: [id])
+  vehicleId      String?
+  vehicle        Vehicle?   @relation(fields: [vehicleId], references: [id])
+  status         TripStatus @default(SCHEDULED)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  dutySlip       DutySlip?
+
+  @@index([clientId])
+  @@map("trips")
+}
+
+model Driver {
+  id                       String    @id @default(cuid())
+  clientId                 String
+  client                   Client    @relation(fields: [clientId], references: [id])
+  name                     String
+  licenseNumber            String
+  contact                  String
+  isAvailable              Boolean   @default(true)
+  licenseExpiry            DateTime?
+  badgeNumber              String?
+  badgeExpiry              DateTime?
+  policeVerificationStatus String?   @default("PENDING") // VERIFIED | PENDING | EXPIRED | NOT_DONE
+  policeVerificationDate   DateTime?
+  medicalFitnessExpiry     DateTime?
+  emergencyContact         String?
+  bloodGroup               String?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  vehicles  Vehicle[]
+  bookings  Booking[]
+  trips     Trip[]
+  documents Document[]
+
+  @@index([clientId])
+  @@map("drivers")
+}
+
+model Vehicle {
+  id                 String    @id @default(cuid())
+  clientId           String
+  client             Client    @relation(fields: [clientId], references: [id])
+  vehicleType        String
+  vehicleName        String?
+  slug               String?
+  pricePerKm         Float       @default(0)
+  sortOrder          Int         @default(0)
+  seats              Int?
+  bags               Int?
+  acType             String?
+  pricingType        String?
+  description        String?     @db.Text
+  vehicleImage       String?     @db.LongText
+  catalogStatus      String      @default("INACTIVE")
+  featured           Boolean     @default(false)
+  registrationNumber String
+  capacity           Int
+  isAvailable        Boolean   @default(true)
+  rcExpiry           DateTime?
+  insuranceExpiry    DateTime?
+  permitExpiry       DateTime?
+  fitnessExpiry      DateTime?
+  pucExpiry          DateTime?
+  taxExpiry          DateTime?
+  currentOdometer    Int?      @default(0)
+  fuelType           String?   // PETROL | DIESEL | CNG | ELECTRIC | HYBRID
+  chassisNumber      String?
+  engineNumber       String?
+  fastagTagNumber    String?
+  operationalStatus  String    @default("AVAILABLE") // AVAILABLE | ON_TRIP | MAINTENANCE | GROUNDED
+  lastServiceDate    DateTime?
+  nextServiceDueKm   Int?
+  nextServiceDueDate DateTime?
+  assignedDriverId   String?
+  assignedDriver     Driver?   @relation(fields: [assignedDriverId], references: [id])
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  bookings        Booking[]
+  trips           Trip[]
+  documents       Document[]
+  maintenanceLogs VehicleMaintenance[]
+
+  @@unique([clientId, registrationNumber])
+  @@index([clientId])
+  @@map("vehicles")
+}
+
+model VehicleMaintenance {
+  id                 String    @id @default(cuid())
+  clientId           String    @map("client_id")
+  vehicleId          String    @map("vehicle_id")
+  serviceType        String    @map("service_type") // SCHEDULED_SERVICE | OIL_CHANGE | TYRE_CHANGE | BRAKE_SERVICE | AC_REPAIR | ENGINE_WORK | ACCIDENT_REPAIR | OTHER
+  serviceDate        DateTime  @map("service_date")
+  odometerAtService  Int?      @map("odometer_at_service")
+  garageWorkshopName String?   @map("garage_workshop_name")
+  garagePhone        String?   @map("garage_phone")
+  costInPaise        Int       @default(0) @map("cost_in_paise")
+  invoiceBillUrl     String?   @map("invoice_bill_url")
+  notes              String?   @db.Text
+  nextServiceDueKm   Int?      @map("next_service_due_km")
+  nextServiceDueDate DateTime? @map("next_service_due_date")
+  status             String    @default("COMPLETED") // SCHEDULED | IN_PROGRESS | COMPLETED
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  client             Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  vehicle            Vehicle   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([vehicleId])
+  @@map("vehicle_maintenance")
+}
+
+model Payment {
+  id            String   @id @default(cuid())
+  clientId      String
+  client        Client   @relation(fields: [clientId], references: [id])
+  bookingId     String
+  booking       Booking  @relation(fields: [bookingId], references: [id])
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id])
+  amountInPaise Int
+  mode          String
+  paymentDate   DateTime
+  reference     String?
+  recordedById  String
+  notes         String?
+  createdAt     DateTime @default(now())
+
+  @@index([clientId])
+  @@map("payments")
+}
+
+model Invoice {
+  id              String   @id @default(cuid())
+  clientId        String
+  client          Client   @relation(fields: [clientId], references: [id])
+  bookingId       String
+  booking         Booking  @relation(fields: [bookingId], references: [id])
+  customerId      String
+  customer        Customer @relation(fields: [customerId], references: [id])
+  hsnSac          String?
+  subtotalInPaise Int
+  gstInPaise      Int
+  totalInPaise    Int
+  pdfFileUrl      String?
+  createdAt       DateTime @default(now())
+
+  @@index([clientId])
+  @@map("invoices")
+}
+
+model Document {
+  id         String    @id @default(cuid())
+  clientId   String
+  client     Client    @relation(fields: [clientId], references: [id])
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+  driverId   String?
+  driver     Driver?   @relation(fields: [driverId], references: [id])
+  vehicleId  String?
+  vehicle    Vehicle?  @relation(fields: [vehicleId], references: [id])
+  type       String
+  fileUrl    String
+  fileKey    String
+  fileSize   Int?
+  expiryDate DateTime?
+  uploadedBy String?
+  createdAt  DateTime  @default(now())
+
+  @@index([clientId])
+  @@map("documents")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id])
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  target    String?
+  metadata  Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([clientId])
+  @@map("audit_log")
+}
+
+// No-code Workflow Automation (SRS section 11/FR-11, Business+ only via
+// the workflow_automation entitlement). A rule is trigger -> action; the
+// condition lives inside the trigger's config (e.g. "hours: 2"). The
+// automation-engine BullMQ job (jobs/automation-engine.job.ts) evaluates
+// active rules on a schedule — there is no real-time event bus, so
+// triggers fire on the next sweep after the condition becomes true, not
+// instantly.
+model AutomationRule {
+  id            String   @id @default(cuid())
+  clientId      String
+  client        Client   @relation(fields: [clientId], references: [id])
+  name          String
+  isActive      Boolean  @default(true)
+  triggerType   String   // ENQUIRY_NO_CONTACT_WITHIN_HOURS | QUOTATION_NOT_FOLLOWED_UP | BOOKING_PAYMENT_OVERDUE | VEHICLE_DOCUMENT_EXPIRING
+  triggerConfig Json
+  actionType    String   // EMAIL_STAFF | CREATE_FOLLOWUP_NOTE | REASSIGN_ENQUIRY
+  actionConfig  Json
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  logs AutomationLog[]
+
+  @@index([clientId])
+  @@map("automation_rules")
+}
+
+// One row per rule firing against one target — doubles as both the audit
+// trail and the de-duplication check (the engine won't refire the same
+// rule against the same target within its cooldown window).
+model AutomationLog {
+  id         String         @id @default(cuid())
+  clientId   String
+  client     Client         @relation(fields: [clientId], references: [id])
+  ruleId     String
+  rule       AutomationRule @relation(fields: [ruleId], references: [id])
+  targetType String         // ENQUIRY | QUOTATION | BOOKING | VEHICLE | TRIP
+  targetId   String
+  channel    String?        // WHATSAPP | EMAIL | BOTH | INTERNAL
+  status     String?        // SENT | FAILED | SIMULATED | READY_LINK
+  recipient  String?        // Phone number or email address
+  message    String?
+  createdAt  DateTime       @default(now())
+
+  @@index([clientId])
+  @@index([ruleId, targetId])
+  @@map("automation_logs")
+}
+
+// -----------------------------------------------------------------------------
+// Enterprise-only models (Phase 10) — Multi-Branch already reuses the
+// Branch model added in onboarding; these two are new: WhatsApp Business
+// API integration and the Custom Module (custom fields) framework.
+// -----------------------------------------------------------------------------
+
+// One row per client. accessTokenEncrypted is only ever populated once a
+// real Meta Business API app is connected — see whatsapp.controller.ts for
+// why this is scaffolding rather than a working integration out of the box.
+model WhatsAppConfig {
+  id                     String   @id @default(cuid())
+  clientId               String   @unique
+  client                 Client   @relation(fields: [clientId], references: [id])
+  provider               String   @default("QUICK_LINK") // QUICK_LINK (wa.me) | META_CLOUD | SIMULATED
+  phoneNumberId          String?
+  businessAccountId      String?
+  accessTokenEncrypted   String?
+  webhookVerifyToken     String?
+  autoWelcomeEnabled     Boolean  @default(false)
+  autoItineraryShare     Boolean  @default(false)
+  autoCabDispatch        Boolean  @default(false)
+  isActive               Boolean  @default(false)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@map("whatsapp_configs")
+}
+
+model WhatsAppTemplate {
+  id          String   @id @default(cuid())
+  clientId    String
+  client      Client   @relation(fields: [clientId], references: [id])
+  name        String
+  category    String   // ITINERARY_SHARE | ENQUIRY_WELCOME | CAB_DISPATCH | BOOKING_CONFIRMATION | PAYMENT_REMINDER | CUSTOM
+  body        String   @db.Text
+  isDefault   Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([category])
+  @@map("whatsapp_templates")
+}
+
+model WhatsAppMessage {
+  id          String   @id @default(cuid())
+  clientId    String
+  client      Client   @relation(fields: [clientId], references: [id])
+  enquiryId   String?
+  direction   String   // INBOUND | OUTBOUND
+  fromNumber  String
+  toNumber    String
+  body        String   @db.Text
+  status      String   @default("QUEUED") // QUEUED | SENT | DELIVERED | FAILED | RECEIVED
+  createdAt   DateTime @default(now())
+
+  @@index([clientId])
+  @@index([enquiryId])
+  @@map("whatsapp_messages")
+}
+
+// No-code Custom Module framework (SRS section 12/FR-12.3, Enterprise
+// only). Deliberately scoped to "add custom fields to an existing module"
+// rather than building an arbitrary new-module generator — that covers
+// the realistic 80% case (an agency wants to track "Passport Number" or
+// "Visa Status" on Customers) without an open-ended schema-builder.
+model CustomFieldDefinition {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id])
+  module    String   // e.g. "customers", "enquiries", "bookings"
+  fieldKey  String   // machine key, e.g. "passport_number"
+  label     String   // display label, e.g. "Passport Number"
+  fieldType String   // TEXT | NUMBER | DATE | BOOLEAN
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  values CustomFieldValue[]
+
+  @@unique([clientId, module, fieldKey])
+  @@index([clientId])
+  @@map("custom_field_definitions")
+}
+
+model CustomFieldValue {
+  id           String                @id @default(cuid())
+  clientId     String
+  client       Client                @relation(fields: [clientId], references: [id])
+  definitionId String
+  definition   CustomFieldDefinition @relation(fields: [definitionId], references: [id])
+  recordId     String                // the id of the Customer/Enquiry/etc row this value belongs to
+  value        Json
+  updatedAt    DateTime              @updatedAt
+
+  @@unique([definitionId, recordId])
+  @@index([clientId])
+  @@map("custom_field_values")
+}
+
+// =============================================================================
+// PHASE 1: DAY-WISE ITINERARY BUILDER & MULTI-TIER PRICING
+// =============================================================================
+
+enum ItineraryStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+model TourTemplate {
+  id                String   @id @default(cuid())
+  clientId          String   @map("client_id")
+  title             String
+  destination       String
+  totalDays         Int      @default(1) @map("total_days")
+  totalNights       Int      @default(0) @map("total_nights")
+  coverImageUrl     String?  @map("cover_image_url")
+  defaultInclusions Json?    @map("default_inclusions")
+  defaultExclusions Json?    @map("default_exclusions")
+  defaultTerms      String?  @db.Text @map("default_terms")
+  days              Json     // Array of { dayNumber, title, stayCity, description, meals, hotelName, roomCategory, hotelRating, transferDetails, photos }
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  client            Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@map("tour_templates")
+}
+
+model Itinerary {
+  id                 String          @id @default(cuid())
+  clientId           String          @map("client_id")
+  enquiryId          String?         @map("enquiry_id")
+  customerId         String?         @map("customer_id")
+  shareSlug          String          @unique @map("share_slug")
+  passcode           String?
+  status             ItineraryStatus @default(DRAFT)
+
+  tripTitle          String          @map("trip_title")
+  destination        String
+  startDate          DateTime?       @map("start_date")
+  endDate            DateTime?       @map("end_date")
+  totalDays          Int             @default(1) @map("total_days")
+  totalNights        Int             @default(0) @map("total_nights")
+  adultsCount        Int             @default(1) @map("adults_count")
+  childrenCount      Int             @default(0) @map("children_count")
+  coverImageUrl      String?         @map("cover_image_url")
+
+  inclusions         Json?
+  exclusions         Json?
+  termsAndConditions String?         @db.Text @map("terms_and_conditions")
+  cancellationPolicy String?         @db.Text @map("cancellation_policy")
+
+  showPricing        Boolean         @default(true) @map("show_pricing")
+  showHotels         Boolean         @default(true) @map("show_hotels")
+  allowDirectAccept  Boolean         @default(true) @map("allow_direct_accept")
+
+  createdAt          DateTime        @default(now()) @map("created_at")
+  updatedAt          DateTime        @updatedAt @map("updated_at")
+
+  client             Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  enquiry            Enquiry?        @relation(fields: [enquiryId], references: [id], onDelete: SetNull)
+  customer           Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  days               ItineraryDay[]
+  pricingTiers       ItineraryPricingTier[]
+
+  @@index([clientId])
+  @@index([shareSlug])
+  @@map("itineraries")
+}
+
+model ItineraryDay {
+  id              String    @id @default(cuid())
+  itineraryId     String    @map("itinerary_id")
+  dayNumber       Int       @map("day_number")
+  date            DateTime?
+  title           String
+  stayCity        String?   @map("stay_city")
+  description     String    @db.Text
+  meals           Json?     // Array of meal types e.g. ["Breakfast", "Dinner"]
+  hotelName       String?   @map("hotel_name")
+  roomCategory    String?   @map("room_category")
+  hotelRating     Int?      @map("hotel_rating")
+  transferDetails String?   @map("transfer_details")
+  photos          Json?     // Array of string URLs
+
+  itinerary       Itinerary @relation(fields: [itineraryId], references: [id], onDelete: Cascade)
+
+  @@index([itineraryId, dayNumber])
+  @@map("itinerary_days")
+}
+
+model ItineraryPricingTier {
+  id             String    @id @default(cuid())
+  itineraryId    String    @map("itinerary_id")
+  tierName       String    @map("tier_name") // "Standard (3★)", "Deluxe (4★)", "Luxury (5★)"
+  pricePerPerson Int       @default(0) @map("price_per_person") // in Paise
+  totalPrice     Int       @default(0) @map("total_price")      // in Paise
+  hotelOverview  String?   @map("hotel_overview")
+  isRecommended  Boolean   @default(false) @map("is_recommended")
+
+  itinerary      Itinerary @relation(fields: [itineraryId], references: [id], onDelete: Cascade)
+
+  @@index([itineraryId])
+  @@map("itinerary_pricing_tiers")
+}
+
+// ==========================================
+// PHASE 3: SUPPLIERS, COSTING & VOUCHERS
+// ==========================================
+
+enum SupplierType {
+  HOTEL
+  TRANSPORTER
+  TOUR_GUIDE
+  ACTIVITY_PROVIDER
+  VISA_AGENT
+  OTHER
+}
+
+enum CostItemType {
+  HOTEL
+  TRANSPORT
+  ACTIVITY
+  GUIDE
+  FLIGHT
+  VISA
+  MISC
+}
+
+enum SupplierPaymentMode {
+  UPI
+  BANK_TRANSFER
+  CASH
+  CHEQUE
+  CREDIT_CARD
+}
+
+enum SupplierPaymentStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+}
+
+enum MealPlan {
+  EP
+  CP
+  MAP
+  AP
+}
+
+enum VoucherStatus {
+  ISSUED
+  CONFIRMED
+  CANCELLED
+}
+
+model Supplier {
+  id             String       @id @default(cuid())
+  clientId       String       @map("client_id")
+  name           String
+  type           SupplierType @default(HOTEL)
+  contactPerson  String?      @map("contact_person")
+  phone          String?
+  whatsapp       String?
+  email          String?
+  city           String?
+  address        String?
+  starRating     Int?         @map("star_rating")
+  bankName       String?      @map("bank_name")
+  accountNumber  String?      @map("account_number")
+  ifscCode       String?      @map("ifsc_code")
+  upiId          String?      @map("upi_id")
+  notes          String?      @db.Text
+  isActive       Boolean      @default(true) @map("is_active")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  client         Client       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  costItems      BookingCostItem[]
+  payments       SupplierPayment[]
+  vouchers       HotelVoucher[]
+
+  @@index([clientId])
+  @@index([type])
+  @@index([city])
+  @@map("suppliers")
+}
+
+model BookingCostItem {
+  id              String                @id @default(cuid())
+  clientId        String                @map("client_id")
+  bookingId       String                @map("booking_id")
+  supplierId      String?               @map("supplier_id")
+  itemType        CostItemType          @default(HOTEL) @map("item_type")
+  description     String
+  quantity        Int                   @default(1)
+  unitCostInPaise Int                   @map("unit_cost_in_paise")
+  totalCostInPaise Int                  @map("total_cost_in_paise")
+  paymentStatus   SupplierPaymentStatus @default(UNPAID) @map("payment_status")
+  notes           String?               @db.Text
+  createdAt       DateTime              @default(now()) @map("created_at")
+  updatedAt       DateTime              @updatedAt @map("updated_at")
+
+  client          Client                @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  booking         Booking               @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  supplier        Supplier?             @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([clientId])
+  @@index([bookingId])
+  @@index([supplierId])
+  @@map("booking_cost_items")
+}
+
+model SupplierPayment {
+  id             String              @id @default(cuid())
+  clientId       String              @map("client_id")
+  supplierId     String              @map("supplier_id")
+  bookingId      String?             @map("booking_id")
+  amountInPaise  Int                 @map("amount_in_paise")
+  paymentDate    DateTime            @default(now()) @map("payment_date")
+  mode           SupplierPaymentMode @default(UPI)
+  reference      String?
+  notes          String?             @db.Text
+  createdAt      DateTime            @default(now()) @map("created_at")
+
+  client         Client              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  supplier       Supplier            @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  booking        Booking?            @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  @@index([clientId])
+  @@index([supplierId])
+  @@index([bookingId])
+  @@map("supplier_payments")
+}
+
+model HotelVoucher {
+  id              String        @id @default(cuid())
+  clientId        String        @map("client_id")
+  bookingId       String        @map("booking_id")
+  supplierId      String?       @map("supplier_id")
+  voucherNumber   String        @unique @map("voucher_number")
+  hotelName       String        @map("hotel_name")
+  city            String?
+  checkInDate     DateTime      @map("check_in_date")
+  checkOutDate    DateTime      @map("check_out_date")
+  roomCategory    String?       @map("room_category")
+  numberOfRooms   Int           @default(1) @map("number_of_rooms")
+  mealPlan        MealPlan      @default(CP) @map("meal_plan")
+  guestNames      Json?         @map("guest_names")
+  specialRequests String?       @db.Text @map("special_requests")
+  status          VoucherStatus @default(ISSUED)
+  issuedAt        DateTime      @default(now()) @map("issued_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  client          Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  booking         Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  supplier        Supplier?     @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([clientId])
+  @@index([bookingId])
+  @@index([voucherNumber])
+  @@map("hotel_vouchers")
+}
+
+// ==========================================
+// PHASE 4: DRIVER MOBILE DUTY SLIP & DISPATCH
+// ==========================================
+
+enum DutySlipStatus {
+  GENERATED
+  DISPATCHED
+  STARTED
+  COMPLETED
+  BILLED
+  CANCELLED
+}
+
+enum DutyExpenseType {
+  TOLL
+  PARKING
+  STATE_TAX
+  FUEL
+  DRIVER_ALLOWANCE
+  MISC
+}
+
+model DutySlip {
+  id                    String          @id @default(cuid())
+  clientId              String          @map("client_id")
+  tripId                String          @unique @map("trip_id")
+  slipNumber            String          @unique @map("slip_number")
+  shareToken            String          @unique @map("share_token")
+
+  passengerName         String?         @map("passenger_name")
+  passengerPhone        String?         @map("passenger_phone")
+  pickupAddress         String?         @map("pickup_address")
+  dropAddress           String?         @map("drop_address")
+  reportingTime         DateTime?       @map("reporting_time")
+
+  driverName            String?         @map("driver_name")
+  driverPhone           String?         @map("driver_phone")
+  vehicleNumber         String?         @map("vehicle_number")
+  vehicleModel          String?         @map("vehicle_model")
+
+  startOdometer         Int?            @map("start_odometer")
+  endOdometer           Int?            @map("end_odometer")
+  totalKm               Int?            @map("total_km")
+
+  startTime             DateTime?       @map("start_time")
+  endTime               DateTime?       @map("end_time")
+  totalHours            Float?          @map("total_hours")
+
+  startOdoPhotoUrl      String?         @map("start_odo_photo_url")
+  endOdoPhotoUrl        String?         @map("end_odo_photo_url")
+
+  tollChargesInPaise    Int             @default(0) @map("toll_charges_in_paise")
+  parkingChargesInPaise Int             @default(0) @map("parking_charges_in_paise")
+  stateTaxInPaise       Int             @default(0) @map("state_tax_in_paise")
+  fuelChargesInPaise    Int             @default(0) @map("fuel_charges_in_paise")
+  driverAllowanceInPaise Int            @default(0) @map("driver_allowance_in_paise")
+  otherChargesInPaise   Int             @default(0) @map("other_charges_in_paise")
+  totalExpensesInPaise  Int             @default(0) @map("total_expenses_in_paise")
+
+  customerOtp           String?         @map("customer_otp")
+  otpVerified           Boolean         @default(false) @map("otp_verified")
+  customerSignature     String?         @db.Text @map("customer_signature")
+  customerRating        Int?            @map("customer_rating")
+  customerFeedback      String?         @db.Text @map("customer_feedback")
+
+  status                DutySlipStatus  @default(GENERATED)
+  notes                 String?         @db.Text
+  dispatchedAt          DateTime?       @map("dispatched_at")
+  createdAt             DateTime        @default(now()) @map("created_at")
+  updatedAt             DateTime        @updatedAt @map("updated_at")
+
+  client                Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  trip                  Trip            @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  expenses              DutySlipExpense[]
+
+  @@index([clientId])
+  @@index([tripId])
+  @@index([shareToken])
+  @@index([slipNumber])
+  @@map("duty_slips")
+}
+
+model DutySlipExpense {
+  id            String          @id @default(cuid())
+  clientId      String          @map("client_id")
+  dutySlipId    String          @map("duty_slip_id")
+  expenseType   DutyExpenseType @default(TOLL) @map("expense_type")
+  amountInPaise Int             @map("amount_in_paise")
+  receiptUrl    String?         @map("receipt_url")
+  notes         String?         @db.Text
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  client        Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  dutySlip      DutySlip        @relation(fields: [dutySlipId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([dutySlipId])
+  @@map("duty_slip_expenses")
+}
+
+// --- Phase 5: Document & Permit Vault and Passenger Manifest ---
+
+enum TravelerType {
+  ADULT
+  CHILD
+  INFANT
+}
+
+enum TravelerGender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum DocumentVerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum DocumentCategory {
+  PASSPORT_FRONT
+  PASSPORT_BACK
+  AADHAAR_FRONT
+  AADHAAR_BACK
+  PAN_CARD
+  DRIVING_LICENSE
+  VISA
+  AIR_TICKET
+  TRAVEL_INSURANCE
+  VACCINATION_CERT
+  HOTEL_VOUCHER
+  PERMIT
+  OTHER
+}
+
+model BookingTraveler {
+  id              String          @id @default(cuid())
+  clientId        String          @map("client_id")
+  bookingId       String          @map("booking_id")
+  travelerType    TravelerType    @default(ADULT) @map("traveler_type")
+  fullName        String          @map("full_name")
+  gender          TravelerGender  @default(MALE)
+  dateOfBirth     DateTime?       @map("date_of_birth")
+  nationality     String?         @default("Indian")
+  passportNumber  String?         @map("passport_number")
+  passportExpiry  DateTime?       @map("passport_expiry")
+  idType          String?         @map("id_type")
+  idNumber        String?         @map("id_number")
+  foodPreference  String?         @map("food_preference")
+  specialRequests String?         @db.Text @map("special_requests")
+  isLeadPassenger Boolean         @default(false) @map("is_lead_passenger")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  client          Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  booking         Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  documents       BookingDocument[]
+
+  @@index([clientId])
+  @@index([bookingId])
+  @@map("booking_travelers")
+}
+
+model BookingDocument {
+  id                 String                     @id @default(cuid())
+  clientId           String                     @map("client_id")
+  bookingId          String                     @map("booking_id")
+  travelerId         String?                    @map("traveler_id")
+  category           DocumentCategory           @default(OTHER)
+  title              String
+  fileUrl            String                     @db.LongText @map("file_url")
+  fileType           String?                    @map("file_type")
+  fileSize           Int?                       @map("file_size")
+  verificationStatus DocumentVerificationStatus @default(PENDING) @map("verification_status")
+  rejectionReason    String?                    @db.Text @map("rejection_reason")
+  uploadedBy         String?                    @map("uploaded_by")
+  notes              String?                    @db.Text
+  createdAt          DateTime                   @default(now()) @map("created_at")
+  updatedAt          DateTime                   @updatedAt @map("updated_at")
+
+  client             Client                     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  booking            Booking                    @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  traveler           BookingTraveler?           @relation(fields: [travelerId], references: [id], onDelete: SetNull)
+
+  @@index([clientId])
+  @@index([bookingId])
+  @@index([travelerId])
+  @@map("booking_documents")
+}
+
